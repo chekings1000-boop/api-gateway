@@ -3,17 +3,13 @@ name: API Gateway CI/CD
 on:
   push:
     branches: [ main, develop ]
-    paths:
-      - 'api-gateway/**'
   pull_request:
     branches: [ main ]
-    paths:
-      - 'api-gateway/**'
 
 env:
-  REGISTRY: docker.io  # Change to your registry (e.g., ghcr.io, your-registry.com)
-  IMAGE_NAME: techcreate/api-gateway
+  DOCKER_IMAGE: techcreate/api-gateway
   SERVICE_NAME: api-gateway
+  SERVICE_PORT: 8702
 
 jobs:
   test:
@@ -30,9 +26,7 @@ jobs:
           cache: maven
 
       - name: Run tests
-        run: |
-          cd api-gateway
-          mvn clean test
+        run: mvn clean test
 
   build-and-push:
     needs: test
@@ -50,9 +44,7 @@ jobs:
           distribution: 'temurin'
 
       - name: Build with Maven
-        run: |
-          cd api-gateway
-          mvn clean package -DskipTests
+        run: mvn clean package -DskipTests
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -60,46 +52,51 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Extract metadata for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=sha,prefix={{branch}}-
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: ./api-gateway
-          file: ./api-gateway/Dockerfile
+          context: .
+          file: ./Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:${{ github.ref_name }}
+            ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+            ${{ github.ref_name == 'main' && format('{0}:latest', env.DOCKER_IMAGE) || '' }}
 
-  deploy-dev:
+  deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop'
-    environment: development
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
     
     steps:
-      - name: Deploy to Development Server
+      - name: Deploy to Server
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.DEV_HOST }}
-          username: ${{ secrets.DEV_USERNAME }}
-          key: ${{ secrets.DEV_SSH_KEY }}
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USERNAME }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
-            docker pull techcreate/api-gateway:develop
-            docker stop api-gateway || true
-            docker rm api-gateway || true
+            # Get the tag to deploy
+            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              TAG="latest"
+            else
+              TAG="develop"
+            fi
+            
+            echo "Deploying ${{ env.SERVICE_NAME }} with tag: $TAG"
+            
+            # Pull the latest image
+            docker pull ${{ env.DOCKER_IMAGE }}:$TAG
+            
+            # Stop and remove existing container
+            docker stop ${{ env.SERVICE_NAME }} || true
+            docker rm ${{ env.SERVICE_NAME }} || true
+            
+            # Run new container
             docker run -d \
-              --name api-gateway \
+              --name ${{ env.SERVICE_NAME }} \
               --network microservices-net \
-              -p 8702:8702 \
+              -p ${{ env.SERVICE_PORT }}:${{ env.SERVICE_PORT }} \
               -e SPRING_CONFIG_IMPORT="optional:configserver:http://config-server-db:8701" \
               -e SPRING_APPLICATION_JSON='{
                 "eureka": {
@@ -111,38 +108,6 @@ jobs:
                 }
               }' \
               -e SPRING_PROFILES_ACTIVE=dev \
-              techcreate/api-gateway:develop
-
-  deploy-prod:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    environment: production
-    
-    steps:
-      - name: Deploy to Production Server
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.PROD_HOST }}
-          username: ${{ secrets.PROD_USERNAME }}
-          key: ${{ secrets.PROD_SSH_KEY }}
-          script: |
-            docker pull techcreate/api-gateway:latest
-            docker stop api-gateway || true
-            docker rm api-gateway || true
-            docker run -d \
-              --name api-gateway \
-              --network microservices-net \
-              -p 8702:8702 \
-              -e SPRING_CONFIG_IMPORT="optional:configserver:http://config-server-db:8701" \
-              -e SPRING_APPLICATION_JSON='{
-                "eureka": {
-                  "client": {
-                    "service-url": {
-                      "defaultZone": "http://eureka-server:8761/eureka/"
-                    }
-                  }
-                }
-              }' \
-              -e SPRING_PROFILES_ACTIVE=prod \
-              techcreate/api-gateway:latest
+              ${{ env.DOCKER_IMAGE }}:$TAG
+            
+            echo "Deployment completed for ${{ env.SERVICE_NAME }}"
