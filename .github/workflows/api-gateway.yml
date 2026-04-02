@@ -42,6 +42,7 @@ jobs:
         with:
           java-version: '21'
           distribution: 'temurin'
+          cache: maven
 
       - name: Build with Maven
         run: mvn clean package -DskipTests
@@ -61,12 +62,13 @@ jobs:
           tags: |
             ${{ env.DOCKER_IMAGE }}:${{ github.ref_name }}
             ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
-            ${{ github.ref_name == 'main' && format('{0}:latest', env.DOCKER_IMAGE) || '' }}
+            ${{ env.DOCKER_IMAGE }}:latest
+            ${{ env.DOCKER_IMAGE }}:${{ env.SERVICE_NAME }}
 
   deploy:
     needs: build-and-push
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
     
     steps:
       - name: Deploy to Server
@@ -76,27 +78,38 @@ jobs:
           username: ${{ secrets.DEPLOY_USERNAME }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
-            # Get the tag to deploy
-            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-              TAG="latest"
-            else
-              TAG="develop"
-            fi
+            set -e  # Exit on error
             
-            echo "Deploying ${{ env.SERVICE_NAME }} with tag: $TAG"
-            
-            # Pull the latest image
-            docker pull ${{ env.DOCKER_IMAGE }}:$TAG
+            echo "========================================="
+            echo "Starting deployment for API Gateway"
+            echo "========================================="
             
             # Stop and remove existing container
-            docker stop ${{ env.SERVICE_NAME }} || true
-            docker rm ${{ env.SERVICE_NAME }} || true
+            echo "Stopping existing container..."
+            sudo docker stop api-gateway || true
+            sudo docker rm api-gateway || true
             
-            # Run new container
-            docker run -d \
-              --name ${{ env.SERVICE_NAME }} \
+            # Remove old images to force fresh pull
+            echo "Removing old images..."
+            sudo docker rmi techcreate/api-gateway:api-gateway || true
+            sudo docker rmi techcreate/api-gateway:latest || true
+            sudo docker rmi techcreate/api-gateway:develop || true
+            sudo docker image prune -f
+            
+            # Pull the latest image
+            echo "Pulling fresh image..."
+            sudo docker pull techcreate/api-gateway:api-gateway
+            
+            # Verify the image was pulled
+            echo "Verifying image..."
+            sudo docker images | grep techcreate/api-gateway
+            
+            # Run the new container with proper network
+            echo "Starting new container..."
+            sudo docker run -d \
+              --name api-gateway \
               --network microservices-net \
-              -p ${{ env.SERVICE_PORT }}:${{ env.SERVICE_PORT }} \
+              -p 8702:8702 \
               -e SPRING_CONFIG_IMPORT="optional:configserver:http://config-server-db:8701" \
               -e SPRING_APPLICATION_JSON='{
                 "eureka": {
@@ -108,6 +121,24 @@ jobs:
                 }
               }' \
               -e SPRING_PROFILES_ACTIVE=dev \
-              ${{ env.DOCKER_IMAGE }}:$TAG
+              techcreate/api-gateway:api-gateway
             
-            echo "Deployment completed for ${{ env.SERVICE_NAME }}"
+            # Wait for container to start
+            sleep 5
+            
+            # Check if container is running
+            if sudo docker ps | grep -q api-gateway; then
+              echo "✅ Container started successfully"
+              echo "Container logs:"
+              sudo docker logs api-gateway --tail 20
+            else
+              echo "❌ Container failed to start"
+              echo "Error logs:"
+              sudo docker logs api-gateway --tail 50 || true
+              exit 1
+            fi
+            
+            echo "========================================="
+            echo "Deployment completed successfully!"
+            echo "API Gateway is running on port 8702"
+            echo "========================================="
